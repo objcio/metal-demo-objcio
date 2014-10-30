@@ -12,303 +12,220 @@
 @import simd;
 @import QuartzCore.CAMetalLayer;
 
-static const NSUInteger g_max_inflight_buffers = 3;
-
-static const size_t MAX_BYTES_PER_FRAME = 1024*1024;
+static matrix_float4x4 rotation_matrix_2d(float radians)
+{
+    float cos = cosf(radians);
+    float sin = sinf(radians);
+    
+    matrix_float4x4 m = {
+        .columns[0] = {  cos, sin, 0, 0 },
+        .columns[1] = { -sin, cos, 0, 0 },
+        .columns[2] = {    0,   0, 1, 0 },
+        .columns[3] = {    0,   0, 0, 1 }
+    };
+    return m;
+}
 
 float quadVertexData[] =
 {
-    0.5, -0.5, -0.5,  1.0,  0.0, 0.0,
-    -0.5, -0.5, -0.5,   0.0,  1.0, 0.0,
-    -0.5, 0.5, -0.5,  0.0, 0.0, 1.0,
+     0.5, -0.5, 0, 1.0, 1.0, 0.0, 0.0, 1.0,
+    -0.5, -0.5, 0, 1.0, 0.0, 1.0, 0.0, 1.0,
+    -0.5,  0.5, 0, 1.0, 0.0, 0.0, 1.0, 1.0,
     
-    0.5, 0.5, -0.5,  1.0, 1.0, 0.0,
-    0.5, -0.5, -0.5,  1.0,  0.0, 0.0,
-    -0.5, 0.5, -0.5,  0.0, 0.0, 1.0
+     0.5,  0.5, 0, 1.0, 1.0, 1.0, 0.0, 1.0,
+     0.5, -0.5, 0, 1.0, 1.0, 0.0, 0.0, 1.0,
+    -0.5,  0.5, 0, 1.0, 0.0, 0.0, 1.0, 1.0,
 };
 
 typedef struct
 {
-    matrix_float4x4 modelview_projection_matrix;
-    matrix_float4x4 normal_matrix;
-} uniforms_t;
+    matrix_float4x4 rotation_matrix;
+} Uniforms;
+
+@interface METLViewController ()
+
+// Long-lived Metal objects
+@property (nonatomic, strong) CAMetalLayer *metalLayer;
+@property (nonatomic, strong) id<MTLDevice> device;
+@property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
+@property (nonatomic, strong) id<MTLLibrary> defaultLibrary;
+@property (nonatomic, strong) id<MTLRenderPipelineState> pipelineState;
+
+// Resources
+@property (nonatomic, strong) id<MTLBuffer> dynamicConstantBuffer;
+@property (nonatomic, strong) id<MTLBuffer> vertexBuffer;
+
+// Transient objects
+@property (nonatomic, strong) id<CAMetalDrawable> currentDrawable;
+
+@property (nonatomic, strong) CADisplayLink *timer;
+
+@property (nonatomic, assign) BOOL layerSizeDidUpdate;
+@property (nonatomic, assign) Uniforms uniforms;
+@property (nonatomic, assign) float rotationAngle;
+
+@end
 
 @implementation METLViewController
-{
-    CAMetalLayer *_metalLayer;
-    id <CAMetalDrawable> _currentDrawable;
-    BOOL _layerSizeDidUpdate;
-    MTLRenderPassDescriptor *_renderPassDescriptor;
 
-    CADisplayLink *_timer;
-    BOOL _gameLoopPaused;
-    dispatch_semaphore_t _inflight_semaphore;
-    id <MTLBuffer> _dynamicConstantBuffer;
-    uint8_t _constantDataBufferIndex;
-
-    id <MTLDevice> _device;
-    id <MTLCommandQueue> _commandQueue;
-    id <MTLLibrary> _defaultLibrary;
-    id <MTLRenderPipelineState> _pipelineState;
-    id <MTLBuffer> _vertexBuffer;
-    id <MTLDepthStencilState> _depthState;
-    id <MTLTexture> _depthTex;
-    id <MTLTexture> _msaaTex;
-
-    matrix_float4x4 _projectionMatrix;
-    matrix_float4x4 _viewMatrix;
-    uniforms_t _uniform_buffer;
-    float _rotation;
-}
-
-- (void)dealloc
-{
+- (void)dealloc {
     [_timer invalidate];
 }
 
-- (void)viewDidLoad
-{
+- (void)viewDidLoad {
     [super viewDidLoad];
+
+    [self setupMetal];
+    [self buildPipeline];
     
-    _constantDataBufferIndex = 0;
-    _inflight_semaphore = dispatch_semaphore_create(g_max_inflight_buffers);
-    
-    [self _setupMetal];
-    [self _loadAssets];
-    
-    _timer = [CADisplayLink displayLinkWithTarget:self selector:@selector(_gameloop)];
-    [_timer addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSDefaultRunLoopMode];
-    
+    // Set up the render loop to redraw in sync with the main screen refresh rate
+    self.timer = [CADisplayLink displayLinkWithTarget:self selector:@selector(redraw)];
+    [self.timer addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSDefaultRunLoopMode];
 }
 
 - (BOOL)prefersStatusBarHidden {
     return YES;
 }
 
-- (void)_setupMetal
-{
-    _device = MTLCreateSystemDefaultDevice();
+- (void)setupMetal {
+    // Create the default Metal device
+    self.device = MTLCreateSystemDefaultDevice();
     
-    _metalLayer = [CAMetalLayer layer];
-    _metalLayer.device = _device;
-    _metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    // Create, configure, and add a Metal sublayer to the current layer
+    self.metalLayer = [CAMetalLayer layer];
+    self.metalLayer.device = self.device;
+    self.metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    self.metalLayer.frame = self.view.bounds;
+    [self.view.layer addSublayer:self.metalLayer];
 
-    [_metalLayer setFrame:self.view.layer.frame];
-    [self.view.layer addSublayer:_metalLayer];
-
-    _commandQueue = [_device newCommandQueue];
+    // Create a long-lived command queue
+    self.commandQueue = [self.device newCommandQueue];
     
-    _defaultLibrary = [_device newDefaultLibrary];
+    // Get the library that contains the functions compiled into our app bundle
+    self.defaultLibrary = [self.device newDefaultLibrary];
 
     self.view.contentScaleFactor = [UIScreen mainScreen].scale;
 }
 
-- (void)_loadAssets
-{
-    _dynamicConstantBuffer = [_device newBufferWithLength:MAX_BYTES_PER_FRAME options:0];
+- (void)buildPipeline {
+    // Generate a vertex buffer for holding the vertex data of the quad
+    self.vertexBuffer = [self.device newBufferWithBytes:quadVertexData
+                                                 length:sizeof(quadVertexData)
+                                                options:MTLResourceOptionCPUCacheModeDefault];
 
-    _vertexBuffer = [_device newBufferWithBytes:quadVertexData length:sizeof(quadVertexData) options:MTLResourceOptionCPUCacheModeDefault];
+    // Generate a buffer for holding the uniform rotation matrix
+    self.dynamicConstantBuffer = [self.device newBufferWithLength:sizeof(Uniforms) options:MTLResourceOptionCPUCacheModeDefault];
 
-    id <MTLFunction> fragmentProgram = [_defaultLibrary newFunctionWithName:@"lighting_fragment"];
-    id <MTLFunction> vertexProgram = [_defaultLibrary newFunctionWithName:@"lighting_vertex"];
+    // Fetch the vertex and fragment functions from the library
+    id<MTLFunction> vertexProgram = [self.defaultLibrary newFunctionWithName:@"vertex_function"];
+    id<MTLFunction> fragmentProgram = [self.defaultLibrary newFunctionWithName:@"fragment_function"];
 
+    // Build a render pipeline descriptor with the desired functions
     MTLRenderPipelineDescriptor *pipelineStateDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
-    [pipelineStateDescriptor setSampleCount: 1];
     [pipelineStateDescriptor setVertexFunction:vertexProgram];
     [pipelineStateDescriptor setFragmentFunction:fragmentProgram];
     pipelineStateDescriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    pipelineStateDescriptor.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     
+    // Compile the render pipeline
     NSError* error = NULL;
-    _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineStateDescriptor error:&error];
-    if (!_pipelineState) {
+    self.pipelineState = [self.device newRenderPipelineStateWithDescriptor:pipelineStateDescriptor error:&error];
+    if (!self.pipelineState) {
         NSLog(@"Failed to created pipeline state, error %@", error);
     }
-    
-    MTLDepthStencilDescriptor *depthStateDesc = [[MTLDepthStencilDescriptor alloc] init];
-    depthStateDesc.depthCompareFunction = MTLCompareFunctionLess;
-    depthStateDesc.depthWriteEnabled = YES;
-    _depthState = [_device newDepthStencilStateWithDescriptor:depthStateDesc];
 }
 
-- (void)setupRenderPassDescriptorForTexture:(id <MTLTexture>) texture
+- (MTLRenderPassDescriptor *)renderPassDescriptorForTexture:(id<MTLTexture>) texture
 {
-    if (_renderPassDescriptor == nil)
-        _renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
-    
-    _renderPassDescriptor.colorAttachments[0].texture = texture;
-    _renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
-    _renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0.65f, 0.65f, 0.65f, 1.0f);
-    _renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
-    
-    if (!_depthTex || (_depthTex && (_depthTex.width != texture.width || _depthTex.height != texture.height)))
-    {
-        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat: MTLPixelFormatDepth32Float width: texture.width height: texture.height mipmapped: NO];
-        _depthTex = [_device newTextureWithDescriptor: desc];
-
-        _renderPassDescriptor.depthAttachment.texture = _depthTex;
-        _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionClear;
-        _renderPassDescriptor.depthAttachment.clearDepth = 1.0f;
-        _renderPassDescriptor.depthAttachment.storeAction = MTLStoreActionDontCare;
-    }
+    // Configure a render pass with properties applicable to its single color attachment (i.e., the framebuffer)
+    MTLRenderPassDescriptor *renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
+    renderPassDescriptor.colorAttachments[0].texture = texture;
+    renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
+    renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(1, 1, 1, 1);
+    renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
+    return renderPassDescriptor;
 }
 
-- (void)_render
-{
-    dispatch_semaphore_wait(_inflight_semaphore, DISPATCH_TIME_FOREVER);
+- (void)render {
+    [self update];
     
-    [self _update];
-    
-    id <MTLCommandBuffer> commandBuffer = [_commandQueue commandBuffer];
+    id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
 
-    id <CAMetalDrawable> drawable = [self currentDrawable];
-    [self setupRenderPassDescriptorForTexture:drawable.texture];
+    id<CAMetalDrawable> drawable = [self currentDrawable];
 
-    id <MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:_renderPassDescriptor];
-    [renderEncoder setDepthStencilState:_depthState];
+    // Set up a render pass to draw into the current drawable's texture
+    MTLRenderPassDescriptor *renderPassDescriptor = [self renderPassDescriptorForTexture:drawable.texture];
 
-    [renderEncoder setRenderPipelineState:_pipelineState];
-    [renderEncoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
-    [renderEncoder setVertexBuffer:_dynamicConstantBuffer offset:(sizeof(uniforms_t) * _constantDataBufferIndex) atIndex:1 ];
+    // Prepare a render command encoder with the current render pass
+    id<MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
 
-    [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:12 instanceCount:1];
+    // Configure and issue our draw call
+    [renderEncoder setRenderPipelineState:self.pipelineState];
+    [renderEncoder setVertexBuffer:self.vertexBuffer offset:0 atIndex:0];
+    [renderEncoder setVertexBuffer:self.dynamicConstantBuffer offset:0 atIndex:1];
+    [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 
     [renderEncoder endEncoding];
 
-    __block dispatch_semaphore_t block_sema = _inflight_semaphore;
-    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
-        dispatch_semaphore_signal(block_sema);
-    }];
-
-    _constantDataBufferIndex = (_constantDataBufferIndex + 1) % g_max_inflight_buffers;
-
+    // Request that the current drawable be presented when rendering is done
     [commandBuffer presentDrawable:drawable];
-
+    
+    // Finalize the command buffer and commit it to its queue
     [commandBuffer commit];
 }
 
-- (void)_reshape
-{
-    float aspect = fabsf(self.view.bounds.size.width / self.view.bounds.size.height);
-    _projectionMatrix = matrix_from_perspective_fov_aspectLH(65.0f * (M_PI / 180.0f), aspect, 0.1f, 100.0f);
+- (void)update {
+    // Generate a rotation matrix for the current rotation angle
+    _uniforms.rotation_matrix = rotation_matrix_2d(self.rotationAngle);
+
+    // Copy the rotation matrix into the uniform buffer for the next frame
+    void *bufferPointer = [self.dynamicConstantBuffer contents];
+    memcpy(bufferPointer, &_uniforms, sizeof(Uniforms));
     
-    _viewMatrix = matrix_identity_float4x4;
+    // Update the rotation angle
+    _rotationAngle += 0.01;
 }
 
-- (void)_update
-{
-    matrix_float4x4 base_model = matrix_multiply(matrix_from_translation(0.0f, 0.0f, 3.0f), matrix_from_rotation(_rotation, 0.0f, 0.0f, 1.0f));
-    matrix_float4x4 base_mv = matrix_multiply(_viewMatrix, base_model);
-    matrix_float4x4 modelViewMatrix = base_mv;
-    
-    _uniform_buffer.normal_matrix = matrix_invert(matrix_transpose(modelViewMatrix));
-    _uniform_buffer.modelview_projection_matrix = matrix_multiply(_projectionMatrix, modelViewMatrix);
-
-    uint8_t *bufferPointer = (uint8_t *)[_dynamicConstantBuffer contents] + (sizeof(uniforms_t) * _constantDataBufferIndex);
-    memcpy(bufferPointer, &_uniform_buffer, sizeof(uniforms_t));
-    
-    _rotation += 0.01f;
-}
-
-- (void)_gameloop
-{
+- (void)redraw {
     @autoreleasepool {
-        if (_layerSizeDidUpdate)
-        {
+        if (self.layerSizeDidUpdate) {
+            // Ensure that the drawable size of the Metal layer is equal to its dimensions in pixels
             CGFloat nativeScale = self.view.window.screen.nativeScale;
-            CGSize drawableSize = self.view.bounds.size;
+            CGSize drawableSize = self.metalLayer.bounds.size;
             drawableSize.width *= nativeScale;
             drawableSize.height *= nativeScale;
-            _metalLayer.drawableSize = drawableSize;
-            
-            [self _reshape];
-            _layerSizeDidUpdate = NO;
+            self.metalLayer.drawableSize = drawableSize;
+
+            self.layerSizeDidUpdate = NO;
         }
         
-        [self _render];
+        // Draw the scene
+        [self render];
         
-        _currentDrawable = nil;
+        self.currentDrawable = nil;
     }
 }
 
-- (void)viewDidLayoutSubviews
-{
-    _layerSizeDidUpdate = YES;
-    [_metalLayer setFrame:self.view.layer.frame];
+- (void)viewDidLayoutSubviews {
+    self.layerSizeDidUpdate = YES;
+    
+    // Re-center the Metal layer in its containing layer with a 1:1 aspect ratio
+    CGSize parentSize = self.view.bounds.size;
+    CGFloat minSize = MIN(parentSize.width, parentSize.height);
+    CGRect frame = CGRectMake((parentSize.width - minSize) / 2,
+                              (parentSize.height - minSize) / 2,
+                              minSize,
+                              minSize);
+    [self.metalLayer setFrame:frame];
 }
 
-#pragma mark Utilities
-
-- (id <CAMetalDrawable>)currentDrawable
-{
-    while (_currentDrawable == nil)
-    {
-        _currentDrawable = [_metalLayer nextDrawable];
-        if (!_currentDrawable)
-        {
-            NSLog(@"CurrentDrawable is nil");
-        }
+- (id <CAMetalDrawable>)currentDrawable {
+    // Our drawable may be nil if we're not on the screen or we've taken too long to render.
+    // Block here until we can draw again.
+    while (_currentDrawable == nil) {
+        _currentDrawable = [self.metalLayer nextDrawable];
     }
     
     return _currentDrawable;
-}
-
-static matrix_float4x4 matrix_from_perspective_fov_aspectLH(const float fovY, const float aspect, const float nearZ, const float farZ)
-{
-    float yscale = 1.0f / tanf(fovY * 0.5f); // 1 / tan == cot
-    float xscale = yscale / aspect;
-    float q = farZ / (farZ - nearZ);
-    
-    matrix_float4x4 m = {
-        .columns[0] = { xscale, 0.0f, 0.0f, 0.0f },
-        .columns[1] = { 0.0f, yscale, 0.0f, 0.0f },
-        .columns[2] = { 0.0f, 0.0f, q, 1.0f },
-        .columns[3] = { 0.0f, 0.0f, q * -nearZ, 0.0f }
-    };
-    
-    return m;
-}
-
-static matrix_float4x4 matrix_from_translation(float x, float y, float z)
-{
-    matrix_float4x4 m = matrix_identity_float4x4;
-    m.columns[3] = (vector_float4) { x, y, z, 1.0 };
-    return m;
-}
-
-static matrix_float4x4 matrix_from_rotation(float radians, float x, float y, float z)
-{
-    vector_float3 v = vector_normalize(((vector_float3){x, y, z}));
-    float cos = cosf(radians);
-    float cosp = 1.0f - cos;
-    float sin = sinf(radians);
-    
-    matrix_float4x4 m = {
-        .columns[0] = {
-            cos + cosp * v.x * v.x,
-            cosp * v.x * v.y + v.z * sin,
-            cosp * v.x * v.z - v.y * sin,
-            0.0f,
-        },
-        
-        .columns[1] = {
-            cosp * v.x * v.y - v.z * sin,
-            cos + cosp * v.y * v.y,
-            cosp * v.y * v.z + v.x * sin,
-            0.0f,
-        },
-        
-        .columns[2] = {
-            cosp * v.x * v.z + v.y * sin,
-            cosp * v.y * v.z - v.x * sin,
-            cos + cosp * v.z * v.z,
-            0.0f,
-        },
-        
-        .columns[3] = { 0.0f, 0.0f, 0.0f, 1.0f
-        }
-    };
-    return m;
 }
 
 @end

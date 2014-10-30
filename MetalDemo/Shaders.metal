@@ -13,37 +13,31 @@ using namespace metal;
 
 typedef struct
 {
-    matrix_float4x4 modelview_projection_matrix;
-    matrix_float4x4 normal_matrix;
-} uniforms_t;
+    float4x4 rotation_matrix;
+} Uniforms;
 
 typedef struct
 {
-    packed_float3 position;
-    packed_float3 color;
-} vertex_t;
+    float4 position;
+    float4 color;
+} VertexIn;
 
 typedef struct {
     float4 position [[position]];
     half4  color;
-} ColorInOut;
+} VertexOut;
 
-vertex ColorInOut lighting_vertex(device vertex_t* vertex_array [[ buffer(0) ]],
-                                  constant uniforms_t& uniforms [[ buffer(1) ]],
-                                  unsigned int vid [[ vertex_id ]])
+vertex VertexOut vertex_function(device VertexIn *vertices[[buffer(0)]],
+                                 constant Uniforms &uniforms [[buffer(1)]],
+                                 uint vid [[vertex_id]])
 {
-    ColorInOut out;
-
-    float4 in_position = float4(float3(vertex_array[vid].position), 1.0);
-    out.position = uniforms.modelview_projection_matrix * in_position;
-    
-    float4 color = float4(vertex_array[vid].color, 1);
-    out.color = half4(color);
-    
+    VertexOut out;
+    out.position = uniforms.rotation_matrix * vertices[vid].position;
+    out.color = half4(vertices[vid].color);
     return out;
 }
 
-fragment half4 lighting_fragment(ColorInOut in [[stage_in]])
+fragment half4 fragment_function(VertexOut in [[stage_in]])
 {
     return in.color;
 }
