@@ -26,15 +26,15 @@ static matrix_float4x4 rotation_matrix_2d(float radians)
     return m;
 }
 
-float quadVertexData[] =
+static float quadVertexData[] =
 {
-     0.5, -0.5, 0, 1.0, 1.0, 0.0, 0.0, 1.0,
-    -0.5, -0.5, 0, 1.0, 0.0, 1.0, 0.0, 1.0,
-    -0.5,  0.5, 0, 1.0, 0.0, 0.0, 1.0, 1.0,
+     0.5, -0.5, 0.0, 1.0,     1.0, 0.0, 0.0, 1.0,
+    -0.5, -0.5, 0.0, 1.0,     0.0, 1.0, 0.0, 1.0,
+    -0.5,  0.5, 0.0, 1.0,     0.0, 0.0, 1.0, 1.0,
     
-     0.5,  0.5, 0, 1.0, 1.0, 1.0, 0.0, 1.0,
-     0.5, -0.5, 0, 1.0, 1.0, 0.0, 0.0, 1.0,
-    -0.5,  0.5, 0, 1.0, 0.0, 0.0, 1.0, 1.0,
+     0.5,  0.5, 0.0, 1.0,     1.0, 1.0, 0.0, 1.0,
+     0.5, -0.5, 0.0, 1.0,     1.0, 0.0, 0.0, 1.0,
+    -0.5,  0.5, 0.0, 1.0,     0.0, 0.0, 1.0, 1.0,
 };
 
 typedef struct
@@ -52,7 +52,7 @@ typedef struct
 @property (nonatomic, strong) id<MTLRenderPipelineState> pipelineState;
 
 // Resources
-@property (nonatomic, strong) id<MTLBuffer> dynamicConstantBuffer;
+@property (nonatomic, strong) id<MTLBuffer> uniformBuffer;
 @property (nonatomic, strong) id<MTLBuffer> vertexBuffer;
 
 // Transient objects
@@ -114,7 +114,7 @@ typedef struct
                                                 options:MTLResourceOptionCPUCacheModeDefault];
 
     // Generate a buffer for holding the uniform rotation matrix
-    self.dynamicConstantBuffer = [self.device newBufferWithLength:sizeof(Uniforms) options:MTLResourceOptionCPUCacheModeDefault];
+    self.uniformBuffer = [self.device newBufferWithLength:sizeof(Uniforms) options:MTLResourceOptionCPUCacheModeDefault];
 
     // Fetch the vertex and fragment functions from the library
     id<MTLFunction> vertexProgram = [self.defaultLibrary newFunctionWithName:@"vertex_function"];
@@ -161,7 +161,7 @@ typedef struct
     // Configure and issue our draw call
     [renderEncoder setRenderPipelineState:self.pipelineState];
     [renderEncoder setVertexBuffer:self.vertexBuffer offset:0 atIndex:0];
-    [renderEncoder setVertexBuffer:self.dynamicConstantBuffer offset:0 atIndex:1];
+    [renderEncoder setVertexBuffer:self.uniformBuffer offset:0 atIndex:1];
     [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 
     [renderEncoder endEncoding];
@@ -178,7 +178,7 @@ typedef struct
     _uniforms.rotation_matrix = rotation_matrix_2d(self.rotationAngle);
 
     // Copy the rotation matrix into the uniform buffer for the next frame
-    void *bufferPointer = [self.dynamicConstantBuffer contents];
+    void *bufferPointer = [self.uniformBuffer contents];
     memcpy(bufferPointer, &_uniforms, sizeof(Uniforms));
     
     // Update the rotation angle

@@ -27,7 +27,7 @@ typedef struct {
     half4  color;
 } VertexOut;
 
-vertex VertexOut vertex_function(device VertexIn *vertices[[buffer(0)]],
+vertex VertexOut vertex_function(device VertexIn *vertices [[buffer(0)]],
                                  constant Uniforms &uniforms [[buffer(1)]],
                                  uint vid [[vertex_id]])
 {
